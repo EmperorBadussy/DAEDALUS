@@ -88,7 +88,7 @@ export interface LessonSection {
   type: 'heading' | 'paragraph' | 'code' | 'note' | 'interactive'
   text?: string
   label?: string
-  interactiveType?: 'encode-base64' | 'url-encode' | 'xss-reflect'
+  interactiveType?: 'encode-base64' | 'url-encode' | 'xss-reflect' | 'sqli-builder'
 }
 
 export interface ChallengeDef {
@@ -144,6 +144,7 @@ export const LESSONS: LessonDef[] = [
       { type: 'paragraph', text: 'Some databases leak data in error messages. ExtractValue on MySQL will cause an XPath error containing the injected expression result.' },
       { type: 'code', text: "' AND ExtractValue(1, CONCAT(0x7e, (SELECT version())))--" },
       { type: 'note', text: 'Defense: parameterized queries (prepared statements). Never concatenate user input into SQL.' },
+      { type: 'interactive', label: 'Try it: Modify the username field and watch the SQL query change', interactiveType: 'sqli-builder' },
     ],
   },
   {
@@ -176,6 +177,7 @@ export const LESSONS: LessonDef[] = [
       { type: 'heading', text: 'A03: Injection' },
       { type: 'paragraph', text: 'Covers SQL, NoSQL, OS command, LDAP, and template injection. Wherever user data is interpreted as code or a command, injection is possible without proper sanitization.' },
       { type: 'note', text: 'Bug bounty tip: A01 and A03 together account for the majority of high/critical findings on public programs.' },
+      { type: 'interactive', label: 'Try it: URL-encode your findings / payloads as you learn', interactiveType: 'url-encode' },
     ],
   },
   {
@@ -218,6 +220,7 @@ export const LESSONS: LessonDef[] = [
       { type: 'heading', text: 'Security-Critical Headers' },
       { type: 'code', text: 'Content-Security-Policy: default-src \'self\'\nX-Frame-Options: DENY\nStrict-Transport-Security: max-age=31536000; includeSubDomains\nX-Content-Type-Options: nosniff\nAccess-Control-Allow-Origin: https://trusted.com\nAuthorization: Bearer <token>\nCookie: session=abc123; Secure; HttpOnly; SameSite=Strict' },
       { type: 'note', text: 'Test: send unexpected methods (DELETE on GET-only endpoints). Check CORS with Origin: https://evil.com. Look for missing security headers.' },
+      { type: 'interactive', label: 'Try it: Base64-encode your test tokens or headers', interactiveType: 'encode-base64' },
     ],
   },
   {
@@ -306,6 +309,7 @@ export const LESSONS: LessonDef[] = [
       { type: 'heading', text: 'Active Techniques' },
       { type: 'code', text: '# DNS resolution with massdns:\nmassdns -r resolvers.txt -t A wordlist.txt target.com\n\n# Permutation expansion:\nalter.py subs.txt | massdns -r resolvers.txt\n\n# VHOST brute:\nffuf -w wordlist.txt -H "Host: FUZZ.target.com" -u https://target.com/' },
       { type: 'note', text: 'After enumeration: check for dangling CNAMEs (subdomain takeover), exposed panels, and default credentials.' },
+      { type: 'interactive', label: 'Try it: URL-encode a subdomain or endpoint you discover', interactiveType: 'url-encode' },
     ],
   },
   {
@@ -503,6 +507,23 @@ export const TRACKS = [
   { id: 'recon' as TrackId,     name: 'RECON Ops',             description: 'Subdomain enum, portscan, attack surface',  color: '#ffcc00', lessons: LESSONS.filter(l => l.trackId === 'recon'),     challenges: CHALLENGES.filter(c => c.trackId === 'recon') },
 ]
 
+// ── Streak helpers ─────────────────────────────────────────────────────────────
+
+function todayISO(): string {
+  return new Date().toISOString().slice(0, 10) // "YYYY-MM-DD"
+}
+
+function yesterdayISO(): string {
+  const d = new Date()
+  d.setDate(d.getDate() - 1)
+  return d.toISOString().slice(0, 10)
+}
+
+/** Multiplier: 1.0 base, +0.1 per streak day, capped at 2.0 */
+export function streakMultiplier(streak: number): number {
+  return Math.min(2.0, 1.0 + streak * 0.1)
+}
+
 // ── Store ─────────────────────────────────────────────────────────────────────
 
 interface AcademyState {
@@ -512,13 +533,20 @@ interface AcademyState {
   completedChallenges: string[]
   achievements: string[]
   streak: number
+  lastActiveDate: string
+  onboardingComplete: boolean
   challengeHistory: ChallengeHistoryEntry[]
+  // XP animation queue: each entry is an amount to animate
+  xpGainQueue: number[]
 
   // Actions
   completeLesson: (lessonId: string) => void
   completeChallenge: (challengeId: string, score: number, time: number) => void
   addXP: (amount: number) => void
   checkAchievements: () => void
+  touchStreak: () => void
+  setOnboardingComplete: () => void
+  popXPGain: () => void
 }
 
 export const useAcademyStore = create<AcademyState>()(
@@ -530,12 +558,43 @@ export const useAcademyStore = create<AcademyState>()(
       completedChallenges: [],
       achievements: [],
       streak: 0,
+      lastActiveDate: '',
+      onboardingComplete: false,
       challengeHistory: [],
+      xpGainQueue: [],
+
+      setOnboardingComplete: () => {
+        set({ onboardingComplete: true })
+      },
+
+      popXPGain: () => {
+        set((s) => ({ xpGainQueue: s.xpGainQueue.slice(1) }))
+      },
+
+      touchStreak: () => {
+        const today = todayISO()
+        const yesterday = yesterdayISO()
+        const last = get().lastActiveDate
+        if (last === today) return // already touched today
+        if (last === yesterday) {
+          set((s) => ({ streak: s.streak + 1, lastActiveDate: today }))
+        } else {
+          // gap > 1 day, or first ever
+          set({ streak: 1, lastActiveDate: today })
+        }
+      },
 
       addXP: (amount) => {
+        get().touchStreak()
+        const mult = streakMultiplier(get().streak)
+        const boosted = Math.round(amount * mult)
         set((state) => {
-          const newXP = state.xp + amount
-          return { xp: newXP, level: getLevel(newXP) }
+          const newXP = state.xp + boosted
+          return {
+            xp: newXP,
+            level: getLevel(newXP),
+            xpGainQueue: [...state.xpGainQueue, boosted],
+          }
         })
         get().checkAchievements()
       },
@@ -564,7 +623,6 @@ export const useAcademyStore = create<AcademyState>()(
         set((s) => ({
           completedChallenges: [...s.completedChallenges, challengeId],
           challengeHistory: [...s.challengeHistory, entry],
-          streak: s.streak + 1,
         }))
         get().addXP(challenge.xpReward)
         get().checkAchievements()

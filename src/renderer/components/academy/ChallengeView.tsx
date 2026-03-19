@@ -1,7 +1,11 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { ArrowLeft, Timer, Lightbulb, Send, CheckCircle2, XCircle, Zap, Star, Shield, AlertTriangle } from 'lucide-react'
+import {
+  ArrowLeft, Timer, Lightbulb, Send, CheckCircle2, XCircle, Zap, Star,
+  Shield, AlertTriangle, Gauge,
+} from 'lucide-react'
 import { useAcademyStore, type ChallengeDef } from '@/lib/academyStore'
+import { playChallengeComplete, playChallengeFail, playAchievementUnlock } from '@/lib/academySounds'
 
 interface ChallengeViewProps {
   challenge: ChallengeDef
@@ -11,8 +15,53 @@ interface ChallengeViewProps {
 }
 
 const HINT_COST = 5
+const HINT_GLOW_SECS = 30
 
-function WafBypassSimulator({ filter, value, onChange }: { filter?: string; value: string; onChange: (v: string) => void }) {
+// ── Similarity helpers ─────────────────────────────────────────────────────────
+
+function jaccardSim(a: string, b: string): number {
+  if (!a || !b) return 0
+  const sa = new Set(a.toLowerCase().split(''))
+  const sb = new Set(b.toLowerCase().split(''))
+  const inter = new Set([...sa].filter(c => sb.has(c)))
+  const union = new Set([...sa, ...sb])
+  return inter.size / union.size
+}
+
+function fuzzyScore(input: string, answer: string | ((s: string) => boolean)): number {
+  if (!input.trim()) return 0
+  if (typeof answer === 'function') {
+    // For function answers, check if it passes
+    if (answer(input.trim())) return 1
+    // Partial scoring: keyword overlap
+    const keywords = ['union', 'select', 'alert', 'script', 'onerror', 'xss', 'injection', 'payload', '1337', 'api', '%25', 'legacy', 'none', 'hs256']
+    const matches = keywords.filter(k => input.toLowerCase().includes(k))
+    return Math.min(matches.length * 0.15, 0.85)
+  }
+  if (typeof answer === 'string') {
+    if (input.trim().toLowerCase() === answer.toLowerCase()) return 1
+    return jaccardSim(input, answer)
+  }
+  return 0
+}
+
+function warmthLabel(score: number): { label: string; color: string } {
+  if (score >= 1.0) return { label: 'CORRECT!', color: '#00ff88' }
+  if (score >= 0.7) return { label: 'VERY CLOSE', color: '#22d3ee' }
+  if (score >= 0.45) return { label: 'GETTING WARMER', color: '#a3e635' }
+  if (score >= 0.2) return { label: 'LUKEWARM', color: '#facc15' }
+  return { label: 'COLD', color: '#6b7280' }
+}
+
+// ── WAF Bypass Simulator ───────────────────────────────────────────────────────
+
+function WafBypassSimulator({
+  filter, value, onChange,
+}: {
+  filter?: string
+  value: string
+  onChange: (v: string) => void
+}) {
   const passes = filter ? !new RegExp(filter, 'i').test(value) : true
   const hasAlert = /alert\s*\(/i.test(value)
 
@@ -51,6 +100,43 @@ function WafBypassSimulator({ filter, value, onChange }: { filter?: string; valu
   )
 }
 
+// ── Confidence Meter ──────────────────────────────────────────────────────────
+
+function ConfidenceMeter({ score }: { score: number }) {
+  const { label, color } = warmthLabel(score)
+  const pct = Math.round(score * 100)
+
+  return (
+    <div className="mt-2 space-y-1.5">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-1.5">
+          <Gauge size={11} style={{ color }} />
+          <span className="font-mono text-[8px] tracking-wider" style={{ color }}>{label}</span>
+        </div>
+        <span className="font-mono text-[8px] text-text-tertiary">{pct}%</span>
+      </div>
+      <div className="relative h-1.5 rounded-full bg-void-800 overflow-hidden">
+        <motion.div
+          animate={{ width: `${pct}%` }}
+          transition={{ duration: 0.35, ease: 'easeOut' }}
+          className="absolute inset-y-0 left-0 rounded-full"
+          style={{ background: `linear-gradient(90deg, #7c3aed, ${color})` }}
+        />
+        {score > 0.05 && (
+          <motion.div
+            animate={{ x: ['0%', '100%', '0%'] }}
+            transition={{ duration: 2, repeat: Infinity, ease: 'linear' }}
+            className="absolute inset-y-0 w-6 opacity-30"
+            style={{ background: 'linear-gradient(90deg, transparent, rgba(255,255,255,0.5), transparent)' }}
+          />
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── Main ChallengeView ────────────────────────────────────────────────────────
+
 export function ChallengeView({ challenge, trackColor, trackName, onBack }: ChallengeViewProps) {
   const { completedChallenges, xp, completeChallenge, addXP } = useAcademyStore()
   const [answer, setAnswer] = useState('')
@@ -60,11 +146,19 @@ export function ChallengeView({ challenge, trackColor, trackName, onBack }: Chal
   const [correct, setCorrect] = useState<boolean | null>(null)
   const [showHints, setShowHints] = useState(false)
   const [xpPopup, setXpPopup] = useState<number | null>(null)
+  const [hintGlowing, setHintGlowing] = useState(false)
+  const [achievementPopup, setAchievementPopup] = useState(false)
+
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const startTimeRef = useRef<number>(Date.now())
+  const hintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const isDone = completedChallenges.includes(challenge.id)
 
+  const confidenceScore = submitted ? (correct ? 1 : 0) : fuzzyScore(answer, challenge.answer)
+  const { color: borderColor } = warmthLabel(confidenceScore)
+
+  // Timer
   useEffect(() => {
     if (!isDone) {
       startTimeRef.current = Date.now()
@@ -74,6 +168,15 @@ export function ChallengeView({ challenge, trackColor, trackName, onBack }: Chal
     }
     return () => { if (timerRef.current) clearInterval(timerRef.current) }
   }, [isDone])
+
+  // Auto-hint glow after 30 seconds
+  useEffect(() => {
+    if (isDone || submitted) return
+    hintTimerRef.current = setTimeout(() => {
+      setHintGlowing(true)
+    }, HINT_GLOW_SECS * 1000)
+    return () => { if (hintTimerRef.current) clearTimeout(hintTimerRef.current) }
+  }, [isDone, submitted])
 
   const formatTime = (secs: number) => {
     const m = Math.floor(secs / 60).toString().padStart(2, '0')
@@ -86,11 +189,13 @@ export function ChallengeView({ challenge, trackColor, trackName, onBack }: Chal
     if (xp - hintsUsed.length * HINT_COST < HINT_COST) return
     addXP(-HINT_COST)
     setHintsUsed(prev => [...prev, idx])
+    setHintGlowing(false)
   }
 
   const handleSubmit = useCallback(() => {
     if (submitted || isDone) return
     if (timerRef.current) clearInterval(timerRef.current)
+    if (hintTimerRef.current) clearTimeout(hintTimerRef.current)
     setSubmitted(true)
 
     let isCorrect = false
@@ -106,14 +211,30 @@ export function ChallengeView({ challenge, trackColor, trackName, onBack }: Chal
       const hintPenalty = hintsUsed.length * HINT_COST
       const awardedXP = Math.max(challenge.xpReward - hintPenalty, Math.floor(challenge.xpReward * 0.3))
       completeChallenge(challenge.id, awardedXP, elapsed)
+      playChallengeComplete()
       setXpPopup(awardedXP)
       setTimeout(() => setXpPopup(null), 3000)
+
+      // First blood achievement popup
+      if (completedChallenges.length === 0) {
+        playAchievementUnlock()
+        setAchievementPopup(true)
+        setTimeout(() => setAchievementPopup(false), 3000)
+      }
+    } else {
+      playChallengeFail()
     }
-  }, [answer, challenge, elapsed, hintsUsed, isDone, submitted, completeChallenge])
+  }, [answer, challenge, elapsed, hintsUsed, isDone, submitted, completeChallenge, completedChallenges.length])
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.ctrlKey && e.key === 'Enter') handleSubmit()
   }
+
+  const pulseBorderStyle = !submitted && answer.trim() ? {
+    boxShadow: `0 0 0 1.5px ${borderColor}60, 0 0 12px ${borderColor}20`,
+    borderColor: `${borderColor}50`,
+    transition: 'box-shadow 0.4s ease, border-color 0.4s ease',
+  } : {}
 
   return (
     <div className="flex flex-col h-full overflow-y-auto bg-void-950 p-6">
@@ -134,6 +255,30 @@ export function ChallengeView({ challenge, trackColor, trackName, onBack }: Chal
           >
             <Zap size={14} />
             +{xpPopup} XP
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Achievement popup */}
+      <AnimatePresence>
+        {achievementPopup && (
+          <motion.div
+            initial={{ opacity: 0, y: 20, scale: 0.8 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -20, scale: 0.9 }}
+            className="fixed top-28 right-6 z-50 flex items-center gap-3 px-4 py-3 rounded-xl font-mono text-[10px] tracking-wider pointer-events-none"
+            style={{
+              background: 'rgba(250,204,21,0.12)',
+              border: '1px solid rgba(250,204,21,0.4)',
+              color: '#fde047',
+              boxShadow: '0 0 24px rgba(250,204,21,0.3)',
+            }}
+          >
+            <span className="text-[18px]">🩸</span>
+            <div>
+              <p className="font-bold">ACHIEVEMENT UNLOCKED</p>
+              <p className="text-[8px] text-yellow-200/70">First Blood</p>
+            </div>
           </motion.div>
         )}
       </AnimatePresence>
@@ -202,11 +347,14 @@ export function ChallengeView({ challenge, trackColor, trackName, onBack }: Chal
           className="mb-4"
         >
           {challenge.type === 'waf-bypass' ? (
-            <WafBypassSimulator
-              filter={challenge.filterRegex}
-              value={answer}
-              onChange={setAnswer}
-            />
+            <div>
+              <WafBypassSimulator
+                filter={challenge.filterRegex}
+                value={answer}
+                onChange={setAnswer}
+              />
+              {answer.trim() && !submitted && <ConfidenceMeter score={confidenceScore} />}
+            </div>
           ) : (
             <div>
               <label className="font-mono text-[9px] text-text-tertiary tracking-wider block mb-1.5">YOUR ANSWER</label>
@@ -221,7 +369,8 @@ export function ChallengeView({ challenge, trackColor, trackName, onBack }: Chal
                     challenge.type === 'surface' ? 'List attack vectors separated by commas...' :
                     'Enter your answer...'
                   }
-                  className="w-full bg-void-800 border border-purple-dim/25 rounded-lg px-3 py-2.5 font-mono text-[10px] text-text-primary placeholder-text-tertiary focus:outline-none focus:border-purple-dim/60 resize-none"
+                  className="w-full bg-void-800 rounded-lg px-3 py-2.5 font-mono text-[10px] text-text-primary placeholder-text-tertiary focus:outline-none resize-none border transition-all"
+                  style={pulseBorderStyle}
                 />
               ) : (
                 <input
@@ -234,9 +383,11 @@ export function ChallengeView({ challenge, trackColor, trackName, onBack }: Chal
                     challenge.type === 'idor' ? 'Enter the request (e.g. GET /api/...)' :
                     'Enter your answer...'
                   }
-                  className="w-full bg-void-800 border border-purple-dim/25 rounded-lg px-3 py-2.5 font-mono text-[10px] text-text-primary placeholder-text-tertiary focus:outline-none focus:border-purple-dim/60"
+                  className="w-full bg-void-800 rounded-lg px-3 py-2.5 font-mono text-[10px] text-text-primary placeholder-text-tertiary focus:outline-none border transition-all"
+                  style={pulseBorderStyle}
                 />
               )}
+              {answer.trim() && !submitted && <ConfidenceMeter score={confidenceScore} />}
               <p className="font-mono text-[8px] text-text-tertiary mt-1">Ctrl+Enter to submit</p>
             </div>
           )}
@@ -245,13 +396,21 @@ export function ChallengeView({ challenge, trackColor, trackName, onBack }: Chal
 
       {/* Hints panel */}
       <div className="mb-4">
-        <button
-          onClick={() => setShowHints(h => !h)}
-          className="flex items-center gap-2 font-mono text-[9px] text-text-tertiary hover:text-yellow-300 transition-colors tracking-wider"
+        <motion.button
+          animate={hintGlowing && !showHints ? {
+            boxShadow: ['0 0 0px rgba(250,204,21,0)', '0 0 12px rgba(250,204,21,0.5)', '0 0 0px rgba(250,204,21,0)'],
+            color: ['#555570', '#fde047', '#555570'],
+          } : {}}
+          transition={hintGlowing ? { duration: 2, repeat: Infinity } : {}}
+          onClick={() => { setShowHints(h => !h); setHintGlowing(false) }}
+          className="flex items-center gap-2 font-mono text-[9px] text-text-tertiary hover:text-yellow-300 transition-colors tracking-wider rounded px-1"
         >
-          <Lightbulb size={12} className={showHints ? 'text-yellow-400' : ''} />
+          <Lightbulb size={12} className={showHints ? 'text-yellow-400' : hintGlowing ? 'text-yellow-400' : ''} />
           {showHints ? 'HIDE HINTS' : 'SHOW HINTS'} (−{HINT_COST} XP each)
-        </button>
+          {hintGlowing && !showHints && (
+            <span className="font-mono text-[7px] text-yellow-400/70 animate-pulse">← click for a nudge</span>
+          )}
+        </motion.button>
 
         <AnimatePresence>
           {showHints && (
@@ -293,9 +452,7 @@ export function ChallengeView({ challenge, trackColor, trackName, onBack }: Chal
             initial={{ opacity: 0, scale: 0.95, y: 8 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
             className={`rounded-xl border p-4 mb-4 ${
-              correct
-                ? 'border-green-500/40 bg-green-500/8'
-                : 'border-red-500/40 bg-red-500/8'
+              correct ? 'border-green-500/40 bg-green-500/8' : 'border-red-500/40 bg-red-500/8'
             }`}
           >
             <div className="flex items-center gap-3">
